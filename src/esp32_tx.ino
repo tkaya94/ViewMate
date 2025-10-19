@@ -8,44 +8,42 @@ static BLEUUID UART_SERVICE("0000FFE0-0000-1000-8000-00805F9B34FB");
 static BLEUUID UART_CHAR   ("0000FFE1-0000-1000-8000-00805F9B34FB");
 
 /* ===== Joystick-Pins ===== */
-const int JOY_X_PIN = 34;  // Pan Auswahl: links/mitte/rechts
+const int JOY_X_PIN = 34;  // Pan Auswahl
 const int JOY_Y_PIN = 35;  // Tilt stufenlos (nur im Tilt-Mode)
 const int JOY_SW_PIN = 27; // Multi-Click
 
-/* ===== Presets (iPhone-13-Pro FOV berücksichtigt) ===== */
+/* ===== Pan-Presets ===== */
 const int PAN_LEFT  = 30;
 const int PAN_MID   = 90;
 const int PAN_RIGHT = 150;
 
+/* ===== Tilt-Bereich ===== */
 const int TILT_MIN  = 40;
-const int TILT_MAX  = 80;
+const int TILT_MAX  = 120;
 
 /* ===== Tuning ===== */
-// Stick/Filter
-int   JOY_DEAD   = 160;     // Deadzone (ADC, 0..4095)
+int   JOY_DEAD    = 160;    // ADC-Deadzone
 const int SAMPLES = 6;      // ADC-Mittelung
-float EMA_ALPHA   = 0.28f;  // 0.25–0.35: höher = direkter
+float EMA_ALPHA   = 0.28f;  // Stick-Glättung
 
-// Tilt-Geschwindigkeit
 float tiltSpeedDegPerSec = 30.0f;
 
-// Sende-/Steuerfrequenzen
-const unsigned long CTRL_DT_MS   = 10;  // 100 Hz Integrationsloop
-const unsigned long SEND_TILT_MS = 16;  // ~62 Hz Tilt-Sendeloop (nur wenn Mode aktiv)
+const unsigned long CTRL_DT_MS   = 10;  // 100 Hz
+const unsigned long SEND_TILT_MS = 16;  // ~62 Hz Tilt
 
 /* ===== Multi-Click ===== */
 const unsigned long DEBOUNCE_MS    = 25;
 const unsigned long MULTI_CLICK_MS = 1200;
 const unsigned long HOLD_CAL_MS    = 2000;
-bool swPrev = HIGH; unsigned long lastSwChangeMs=0, lastClickMs=0; int clickCount=0;
-bool tiltAdjustMode=false;
+bool  swPrev = HIGH; unsigned long lastSwChangeMs=0, lastClickMs=0; int clickCount=0;
+bool  tiltAdjustMode=false;
 
-/* ===== ADC-Mitte (Kalibrierung) ===== */
+/* ===== ADC-Mitte ===== */
 int adcMidX = 2048, adcMidY = 2048;
 
 /* ===== Zeitmarken ===== */
 unsigned long lastCtrlMs=0, lastSendTiltMs=0, lastDbgMs=0;
-const unsigned long DBG_MS=500;
+const unsigned long DBG_MS=600;
 
 /* ===== BLE ===== */
 BLEAdvertisedDevice* g_found=nullptr;
@@ -89,11 +87,11 @@ bool bleConnect(){
 void bleSendLine(const String& s){
   if(!linkUp()) return;
   String out=s; if(out.length()==0 || out[out.length()-1]!='\n') out+='\n';
-  // HM-10/BT05 bleibt oft bei 20 Byte MTU → kurze Frames
   if (g_uartChar->canWriteNoResponse()) g_uartChar->writeValue((uint8_t*)out.c_str(), out.length(), false);
   else                                   g_uartChar->writeValue((uint8_t*)out.c_str(), out.length(), true);
 }
 
+/* ===== Kalibrierung Mitte ===== */
 void calibrateCenter(){
   Serial.print("[CAL] Mitte...");
   unsigned long t0=millis(); long sx=0, sy=0; int n=0;
@@ -103,11 +101,12 @@ void calibrateCenter(){
   Serial.print(" Y="); Serial.println(adcMidY);
 }
 
+/* ===== Taster / Multi-Click ===== */
 void handleSW(){
   unsigned long now=millis();
   bool sw = digitalRead(JOY_SW_PIN);
 
-  // Hold→Kalibrierung
+  // Hold→Kalibrieren
   static bool holdArmed=false; static unsigned long holdStart=0;
   if (sw==LOW && swPrev==HIGH && (now-lastSwChangeMs)>DEBOUNCE_MS) { holdArmed=true; holdStart=now; }
   if (holdArmed && sw==LOW && (now-holdStart)>HOLD_CAL_MS) { holdArmed=false; calibrateCenter(); clickCount=0; lastClickMs=now; }
@@ -134,7 +133,22 @@ void handleSW(){
   }
 }
 
+/* ===== PAN: Latch mit Dwell-Timern =====
+   - LEFT/RIGHT bleiben aktiv, solange NICHT echte Neutralzone gehalten wird.
+   - NEUTRAL wird erst nach NEU_DWELL_MS bestätigt.
+   - LEFT/RIGHT werden erst nach ENTER_DWELL_MS bestätigt.
+*/
 enum PanState { P_LEFT, P_MID, P_RIGHT };
+PanState panState = P_MID;
+
+// Schwellen & Zeiten (ADC-Ticks / Millisekunden)
+const int  NEUTRAL_ZONE   = 200;   // Neutral-Erkennung (enger/höher machen bei Rauschen)
+const int  ENTER_TH       = 300;   // ab hier L/R „gewünscht“
+const unsigned long NEU_DWELL_MS   = 80; // Neutral muss so lange gehalten werden
+const unsigned long ENTER_DWELL_MS = 80;  // L/R-Ausschlag muss so lange anliegen
+
+// Timer
+unsigned long enterLeftStart=0, enterRightStart=0, neutralStart=0;
 
 void setup(){
   Serial.begin(115200);
@@ -163,11 +177,8 @@ void loop(){
 
   // (Re)connect
   if (!linkUp()) {
-    if (g_found && bleConnect()) {
-      Serial.println("[BLE] READY");
-    } else {
-      BLEDevice::getScan()->start(5, false);
-    }
+    if (g_found && bleConnect()) Serial.println("[BLE] READY");
+    else BLEDevice::getScan()->start(5, false);
   }
 
   // ===== 100 Hz: Joystick lesen & Logik =====
@@ -180,20 +191,58 @@ void loop(){
     int dx = rawX - adcMidX;
     int dy = rawY - adcMidY;
 
-    // --- PAN: 3 feste Zustände mit Hysterese ---
-    static PanState panState = P_MID;
-    static const int HYST = 60;  // zusätzliche Hysterese gegen Flattern
+    // ---- PAN-FSM mit Dwell ----
+    bool isNeutral = (abs(dx) <= NEUTRAL_ZONE);
+    bool wantLeft  = (dx < -ENTER_TH);
+    bool wantRight = (dx >  ENTER_TH);
 
-    if (dx < -(JOY_DEAD + HYST)) {
-      if (panState != P_LEFT) { panState = P_LEFT;  if (linkUp()) bleSendLine(String("PT:") + PAN_LEFT); }
-    } else if (dx >  (JOY_DEAD + HYST)) {
-      if (panState != P_RIGHT){ panState = P_RIGHT; if (linkUp()) bleSendLine(String("PT:") + PAN_RIGHT); }
-    } else if (abs(dx) <= JOY_DEAD) {
-      if (panState != P_MID)  { panState = P_MID;   if (linkUp()) bleSendLine(String("PT:") + PAN_MID); }
+    switch (panState) {
+      case P_MID:
+        // L/R nur übernehmen, wenn ENTER_TH stabil für ENTER_DWELL_MS
+        if (wantLeft) {
+          if (enterLeftStart==0) enterLeftStart=now;
+          if (now - enterLeftStart >= ENTER_DWELL_MS) {
+            panState = P_LEFT; enterLeftStart=enterRightStart=neutralStart=0;
+            if (linkUp()) bleSendLine(String("PT:") + PAN_LEFT);
+          }
+        } else enterLeftStart=0;
+
+        if (wantRight) {
+          if (enterRightStart==0) enterRightStart=now;
+          if (now - enterRightStart >= ENTER_DWELL_MS) {
+            panState = P_RIGHT; enterLeftStart=enterRightStart=neutralStart=0;
+            if (linkUp()) bleSendLine(String("PT:") + PAN_RIGHT);
+          }
+        } else enterRightStart=0;
+
+        // in MID bleibt er, auch wenn isNeutral — kein Kommando nötig
+        break;
+
+      case P_LEFT:
+        // Solange NICHT neutral stabil gehalten wird, bleibt LEFT aktiv.
+        if (isNeutral) {
+          if (neutralStart==0) neutralStart=now;
+          if (now - neutralStart >= NEU_DWELL_MS) {
+            panState = P_MID; enterLeftStart=enterRightStart=neutralStart=0;
+            if (linkUp()) bleSendLine(String("PT:") + PAN_MID);
+          }
+        } else neutralStart=0;
+        // willRight ignorieren (erst Neutral → dann ggf. Right)
+        break;
+
+      case P_RIGHT:
+        if (isNeutral) {
+          if (neutralStart==0) neutralStart=now;
+          if (now - neutralStart >= NEU_DWELL_MS) {
+            panState = P_MID; enterLeftStart=enterRightStart=neutralStart=0;
+            if (linkUp()) bleSendLine(String("PT:") + PAN_MID);
+          }
+        } else neutralStart=0;
+        // willLeft ignorieren (erst Neutral → dann ggf. Left)
+        break;
     }
-    // Hinweis: Wenn Tilt-Adjust aktiv ist, darf Empfänger Pan ignorieren – die Regel bleibt dort.
 
-    // --- TILT: stufenlos nur im Tilt-Adjust-Mode ---
+    // ---- TILT: stufenlos nur im Tilt-Adjust-Mode ----
     if (tiltAdjustMode) {
       if (abs(dy) < JOY_DEAD) dy = 0;
       const float JOY_RANGE = 2048.0f;
@@ -203,11 +252,10 @@ void loop(){
       tiltFilt += EMA_ALPHA * (tiltCmd - tiltFilt);
 
       if (fabs(tiltFilt) > 0.001f) {
-        static float tiltTarget = 90.0f; // nur Sender-seitig für Fluss
+        static float tiltTarget = 90.0f;
         tiltTarget += tiltFilt * tiltSpeedDegPerSec * dt;
         tiltTarget = clampf(tiltTarget, TILT_MIN, TILT_MAX);
 
-        // ~62 Hz senden (separater Takt)
         if (now - lastSendTiltMs >= SEND_TILT_MS && linkUp()) {
           lastSendTiltMs = now;
           char buf[16]; snprintf(buf, sizeof(buf), "TT:%d", (int)round(tiltTarget));
@@ -220,11 +268,14 @@ void loop(){
   // Tasten-Logik
   handleSW();
 
-  // Debug (optional)
+  // Debug
   if (now - lastDbgMs > DBG_MS) {
     lastDbgMs = now;
-    Serial.print("[DBG] mode="); Serial.print(tiltAdjustMode?"TA:ON":"TA:OFF");
-    Serial.print("  dead="); Serial.print(JOY_DEAD);
-    Serial.print("  alpha="); Serial.println(EMA_ALPHA, 2);
+    Serial.print("[DBG] panState=");
+    Serial.print(panState==P_LEFT?"L":(panState==P_MID?"M":"R"));
+    Serial.print("  NEUms="); Serial.print(NEU_DWELL_MS);
+    Serial.print("  ENms=");  Serial.print(ENTER_DWELL_MS);
+    Serial.print("  NEU=");   Serial.print(NEUTRAL_ZONE);
+    Serial.print("  ENTH=");  Serial.println(ENTER_TH);
   }
 }
